@@ -1,9 +1,10 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 
 const MAX_DEPTH = 5;
 const MAX_URLS = 200;
+const MASTER_URLS_KEY = 'workday-scanner-master-urls';
 
 interface Finding {
   html_context: string;
@@ -31,6 +32,17 @@ interface ScannedUrl {
   analysis?: AnalyzedUrl;
 }
 
+function normalizeUrlForCompare(url: string): string {
+  try {
+    const u = url.startsWith('http') ? url : `https://${url}`;
+    const obj = new URL(u);
+    obj.hash = '';
+    return obj.href.replace(/\/$/, '');
+  } catch {
+    return url;
+  }
+}
+
 export default function WebsiteScanner() {
   const [baseUrl, setBaseUrl] = useState('');
   const [keywords, setKeywords] = useState('');
@@ -38,12 +50,38 @@ export default function WebsiteScanner() {
   const [isScanning, setIsScanning] = useState(false);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [scannedURLs, setScannedURLs] = useState<ScannedUrl[]>([]);
+  const [masterUrlList, setMasterUrlList] = useState<ScannedUrl[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [scanProgress, setScanProgress] = useState<{
     current: number;
     total: number;
     currentUrl: string;
   } | null>(null);
+  const [uploadInputKey, setUploadInputKey] = useState(0);
+  const [pastedUrls, setPastedUrls] = useState('');
+
+  const loadMasterFromStorage = useCallback(() => {
+    try {
+      const raw = typeof window !== 'undefined' ? localStorage.getItem(MASTER_URLS_KEY) : null;
+      if (raw) {
+        const parsed = JSON.parse(raw) as Array<{ url: string; depth: number }>;
+        const list: ScannedUrl[] = (parsed || []).map((u) => ({
+          url: normalizeUrlForCompare(u.url),
+          depth: typeof u.depth === 'number' ? u.depth : 0,
+          status: 'pending' as const,
+        }));
+        setMasterUrlList(list);
+        setScannedURLs(list);
+        return list;
+      }
+    } catch (_) {}
+    setMasterUrlList([]);
+    return [];
+  }, []);
+
+  useEffect(() => {
+    loadMasterFromStorage();
+  }, [loadMasterFromStorage]);
 
   const validateUrl = (url: string): boolean => {
     try {
@@ -52,6 +90,13 @@ export default function WebsiteScanner() {
     } catch {
       return false;
     }
+  };
+
+  const mergeUrlLists = (existing: ScannedUrl[], incoming: ScannedUrl[]): ScannedUrl[] => {
+    const byUrl = new Map<string, ScannedUrl>();
+    for (const s of existing) byUrl.set(normalizeUrlForCompare(s.url), s);
+    for (const s of incoming) byUrl.set(normalizeUrlForCompare(s.url), s);
+    return Array.from(byUrl.values());
   };
 
   const handleScan = async () => {
@@ -67,18 +112,14 @@ export default function WebsiteScanner() {
 
     setIsScanning(true);
     setError(null);
-    setScannedURLs([]);
     setScanProgress({ current: 0, total: 0, currentUrl: 'Starting scan...' });
 
+    const currentMaster = masterUrlList.length > 0 ? masterUrlList : loadMasterFromStorage();
+    const excludeUrls = currentMaster.map((u) => u.url);
+
     try {
-      const keywordList = keywords
-        .split(/[,;]/)
-        .map((k) => k.trim())
-        .filter(Boolean);
-      const workStreamList = workStreamAreas
-        .split(/[,;]/)
-        .map((w) => w.trim())
-        .filter(Boolean);
+      const keywordList = keywords.split(/[,;]/).map((k) => k.trim()).filter(Boolean);
+      const workStreamList = workStreamAreas.split(/[,;]/).map((w) => w.trim()).filter(Boolean);
 
       const response = await fetch('/api/website/scan', {
         method: 'POST',
@@ -89,6 +130,7 @@ export default function WebsiteScanner() {
           maxDepth: MAX_DEPTH,
           keywords: keywordList,
           workStreamAreas: workStreamList,
+          excludeUrls,
         }),
       });
 
@@ -99,12 +141,14 @@ export default function WebsiteScanner() {
 
       const data = await response.json();
       if (data.success && data.urls) {
-        const urls: ScannedUrl[] = data.urls.map((u: { url: string; depth: number }) => ({
+        const newEntries: ScannedUrl[] = data.urls.map((u: { url: string; depth: number }) => ({
           url: u.url,
           depth: u.depth,
           status: 'pending' as const,
         }));
-        setScannedURLs(urls);
+        const merged = mergeUrlLists(currentMaster, newEntries);
+        setScannedURLs(merged);
+        setMasterUrlList(merged);
       } else {
         throw new Error(data.error || 'Failed to scan website');
       }
@@ -116,9 +160,87 @@ export default function WebsiteScanner() {
     }
   };
 
+  const handleSaveUrls = () => {
+    if (scannedURLs.length === 0) {
+      setError('No URLs to save. Run a scan or load URLs first.');
+      return;
+    }
+    const toSave = scannedURLs.map((s) => ({ url: s.url, depth: s.depth }));
+    try {
+      localStorage.setItem(MASTER_URLS_KEY, JSON.stringify(toSave));
+      setMasterUrlList(scannedURLs);
+    } catch (_) {
+      setError('Could not save to browser storage.');
+      return;
+    }
+    const blob = new Blob([toSave.map((u) => u.url).join('\n')], { type: 'text/plain' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `workday-scanner-urls-${new Date().toISOString().slice(0, 10)}.txt`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+    setError(null);
+  };
+
+  const handleLoadUrls = (file: File | null, pastedText?: string) => {
+    const parse = (text: string): ScannedUrl[] => {
+      const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+      const urls: ScannedUrl[] = [];
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
+          urls.push({ url: normalizeUrlForCompare(trimmed), depth: 0, status: 'pending' });
+        }
+      }
+      try {
+        const asJson = JSON.parse(text);
+        if (Array.isArray(asJson)) {
+          for (const item of asJson) {
+            const url = typeof item === 'string' ? item : item?.url;
+            if (url && (url.startsWith('http://') || url.startsWith('https://'))) {
+              urls.push({
+                url: normalizeUrlForCompare(url),
+                depth: typeof item?.depth === 'number' ? item.depth : 0,
+                status: 'pending',
+              });
+            }
+          }
+          return urls;
+        }
+      } catch (_) {}
+      return urls;
+    };
+
+    if (file) {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const text = (reader.result as string) || '';
+        const parsed = parse(text);
+        if (parsed.length === 0) {
+          setError('No valid URLs found in the file.');
+          return;
+        }
+        setScannedURLs((prev) => mergeUrlLists(prev, parsed));
+        setMasterUrlList((prev) => mergeUrlLists(prev, parsed));
+        setError(null);
+        setUploadInputKey((k) => k + 1);
+      };
+      reader.readAsText(file);
+    } else if (pastedText?.trim()) {
+      const parsed = parse(pastedText);
+      if (parsed.length === 0) {
+        setError('No valid URLs found in the pasted text.');
+        return;
+      }
+      setScannedURLs((prev) => mergeUrlLists(prev, parsed));
+      setMasterUrlList((prev) => mergeUrlLists(prev, parsed));
+      setError(null);
+    }
+  };
+
   const handleAnalyze = async () => {
     if (scannedURLs.length === 0) {
-      setError('Please run a scan first');
+      setError('Please run a scan or load URLs first.');
       return;
     }
 
@@ -127,13 +249,14 @@ export default function WebsiteScanner() {
 
     const keywordList = keywords.split(/[,;]/).map((k) => k.trim()).filter(Boolean);
     const workStreamList = workStreamAreas.split(/[,;]/).map((w) => w.trim()).filter(Boolean);
+    const urlList = scannedURLs.map((s) => s.url);
 
     try {
       const response = await fetch('/api/website/analyze', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          urls: scannedURLs.map((s) => s.url),
+          urls: urlList,
           keywords: keywordList,
           workStreamAreas: workStreamList,
         }),
@@ -251,9 +374,12 @@ export default function WebsiteScanner() {
         <p className="text-xs text-gray-500 mt-1">Work stream areas from the college to consider when classifying and recommending updates.</p>
       </div>
 
-      {/* Starting URL */}
+      {/* Starting URL + Scan */}
       <div className="bg-white border-2 border-gray-200 rounded-xl p-6">
         <label className="block text-sm font-semibold text-gray-700 mb-3">Starting URL</label>
+        <p className="text-xs text-gray-500 mb-2">
+          New scans exclude URLs already in your saved list so you can pick up where you left off.
+        </p>
         <div className="flex gap-3">
           <input
             type="text"
@@ -275,11 +401,50 @@ export default function WebsiteScanner() {
                 <span>Scanning…</span>
               </>
             ) : (
-              <>
-                <span>Scan ({MAX_DEPTH} layers)</span>
-              </>
+              <span>Scan ({MAX_DEPTH} layers)</span>
             )}
           </button>
+        </div>
+      </div>
+
+      {/* Load / Upload URLs */}
+      <div className="bg-white border-2 border-gray-200 rounded-xl p-6">
+        <label className="block text-sm font-semibold text-gray-700 mb-2">Load URLs</label>
+        <p className="text-xs text-gray-500 mb-3">
+          Upload a .txt file (one URL per line) or .json array of URLs to add to your list and run analysis.
+        </p>
+        <div className="flex flex-wrap gap-3 items-end">
+          <input
+            key={uploadInputKey}
+            type="file"
+            accept=".txt,.json,text/plain,application/json"
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+              if (file) handleLoadUrls(file);
+            }}
+            className="block w-full max-w-xs text-sm text-gray-600 file:mr-4 file:py-2 file:px-4 file:rounded file:border-0 file:bg-black file:text-white file:font-semibold"
+          />
+          <div className="flex-1 min-w-[200px] flex gap-2">
+            <textarea
+              value={pastedUrls}
+              onChange={(e) => setPastedUrls(e.target.value)}
+              placeholder="Paste URLs (one per line) then click Add"
+              rows={2}
+              className="flex-1 px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-black focus:border-transparent"
+            />
+            <button
+              type="button"
+              onClick={() => {
+                if (pastedUrls.trim()) {
+                  handleLoadUrls(null, pastedUrls);
+                  setPastedUrls('');
+                }
+              }}
+              className="px-4 py-2 bg-black text-white rounded-lg font-semibold hover:bg-gray-800 shrink-0"
+            >
+              Add these URLs
+            </button>
+          </div>
         </div>
       </div>
 
@@ -304,12 +469,19 @@ export default function WebsiteScanner() {
         <>
           <div className="flex flex-wrap items-center justify-between gap-4 bg-white border-2 border-gray-200 rounded-xl p-4">
             <div>
-              <p className="font-semibold text-gray-700">{scannedURLs.length} URL(s) found (up to {MAX_DEPTH} layers)</p>
+              <p className="font-semibold text-gray-700">{scannedURLs.length} URL(s) in list</p>
               <p className="text-sm text-gray-500">
                 {scannedURLs.filter((s) => s.status === 'analyzed').length} analyzed · {urlsWithFindings.length} with CougarWeb/Colleague references
               </p>
             </div>
-            <div className="flex gap-3">
+            <div className="flex flex-wrap gap-3">
+              <button
+                type="button"
+                onClick={handleSaveUrls}
+                className="px-6 py-2 bg-gray-700 text-white rounded-lg font-semibold hover:bg-gray-800"
+              >
+                Save URLs
+              </button>
               <button
                 type="button"
                 onClick={handleAnalyze}
@@ -331,10 +503,10 @@ export default function WebsiteScanner() {
           </div>
 
           <div className="space-y-4">
-            <h3 className="text-xl font-bold text-gray-800">Scanned URLs &amp; recommended updates</h3>
+            <h3 className="text-xl font-bold text-gray-800">URL list &amp; recommended updates</h3>
             <div className="space-y-4 max-h-[70vh] overflow-y-auto">
               {scannedURLs.map((scanned, idx) => (
-                <div key={idx} className="bg-white border-2 border-gray-200 rounded-xl p-6">
+                <div key={scanned.url + idx} className="bg-white border-2 border-gray-200 rounded-xl p-6">
                   <div className="flex items-start justify-between gap-4 mb-3">
                     <a
                       href={scanned.url}

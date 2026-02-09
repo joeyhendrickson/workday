@@ -70,20 +70,38 @@ function extractLinks(html: string, baseUrl: string, currentDepth: number, maxDe
   return links;
 }
 
+function normalizeUrl(url: string): string | null {
+  try {
+    const urlObj = new URL(url);
+    urlObj.hash = '';
+    return urlObj.href.replace(/\/$/, '');
+  } catch {
+    return null;
+  }
+}
+
 async function crawlWebsite(
   startUrl: string,
   maxUrls: number,
-  maxDepth: number
+  maxDepth: number,
+  excludeUrls: string[] = []
 ): Promise<URLData[]> {
   const visited = new Set<string>();
   const urls: URLData[] = [];
-  const queue: Array<{ url: string; depth: number }> = [{ url: startUrl, depth: 0 }];
+  const excludeSet = new Set<string>();
+  for (const u of excludeUrls) {
+    const n = normalizeUrl(u.startsWith('http') ? u : `https://${u}`);
+    if (n) excludeSet.add(n);
+  }
+
+  const startNormalized = normalizeUrl(startUrl.startsWith('http') ? startUrl : `https://${startUrl}`);
+  if (!startNormalized) return [];
+  const queue: Array<{ url: string; depth: number }> = [{ url: startNormalized, depth: 0 }];
 
   while (queue.length > 0 && urls.length < maxUrls) {
     const { url, depth } = queue.shift()!;
 
-    // Normalize URL
-    let normalizedUrl: string;
+    let normalizedUrl: string | null;
     try {
       const urlObj = new URL(url);
       urlObj.hash = '';
@@ -91,8 +109,9 @@ async function crawlWebsite(
     } catch {
       continue;
     }
+    if (!normalizedUrl) continue;
 
-    if (visited.has(normalizedUrl) || depth > maxDepth) {
+    if (visited.has(normalizedUrl) || depth > maxDepth || excludeSet.has(normalizedUrl)) {
       continue;
     }
 
@@ -104,8 +123,9 @@ async function crawlWebsite(
       if (html) {
         const links = extractLinks(html, normalizedUrl, depth, maxDepth);
         for (const link of links) {
-          if (!visited.has(link) && urls.length < maxUrls) {
-            queue.push({ url: link, depth: depth + 1 });
+          const norm = normalizeUrl(link);
+          if (norm && !visited.has(norm) && !excludeSet.has(norm) && urls.length < maxUrls) {
+            queue.push({ url: norm, depth: depth + 1 });
           }
         }
       }
@@ -118,7 +138,7 @@ async function crawlWebsite(
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    const { url, maxUrls = 200, maxDepth = 5, keywords, workStreamAreas } = body;
+    const { url, maxUrls = 200, maxDepth = 5, keywords, workStreamAreas, excludeUrls = [] } = body;
 
     if (!url) {
       return NextResponse.json(
@@ -153,7 +173,8 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const urls = await crawlWebsite(validatedUrl, maxUrls, maxDepth);
+    const excludeList = Array.isArray(excludeUrls) ? excludeUrls : [];
+    const urls = await crawlWebsite(validatedUrl, maxUrls, maxDepth, excludeList);
 
     return NextResponse.json({
       success: true,

@@ -84,9 +84,9 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    if (urls.length > 100) {
+    if (urls.length > 500) {
       return NextResponse.json(
-        { success: false, error: 'Maximum 100 URLs per request' },
+        { success: false, error: 'Maximum 500 URLs per request' },
         { status: 400 }
       );
     }

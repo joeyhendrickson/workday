@@ -7,14 +7,15 @@ export function getOpenAIClient(): OpenAI {
     return openaiClient;
   }
 
-  const apiKey = process.env.OPENAI_API_KEY;
+  const rawKey = process.env.OPENAI_API_KEY;
+  const apiKey = typeof rawKey === 'string' ? rawKey.trim() : '';
 
   if (!apiKey) {
-    throw new Error('OpenAI API key must be set');
+    throw new Error('OpenAI API key must be set in .env.local (OPENAI_API_KEY=sk-proj-...)');
   }
 
   openaiClient = new OpenAI({
-    apiKey: apiKey,
+    apiKey,
   });
 
   return openaiClient;
