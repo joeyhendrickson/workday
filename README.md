@@ -1,6 +1,6 @@
-# Ultra Advisor
+# WorkDay Advisor
 
-An intelligent FAQ and advisory application for Blackboard Ultra content management, powered by OpenAI GPT-4o-mini, Pinecone vector database, and Google Drive integration.
+An intelligent FAQ and advisory application for WorkDay content management, powered by OpenAI GPT-4o-mini, Pinecone vector database, and Google Drive integration.
 
 ## Features
 

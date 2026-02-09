@@ -1,453 +1,262 @@
 import { NextRequest, NextResponse } from 'next/server';
 import axios from 'axios';
-import { chatCompletion, getEmbedding } from '@/lib/openai';
-import { queryPinecone } from '@/lib/pinecone';
+import { chatCompletion } from '@/lib/openai';
 
-export const maxDuration = 300; // 5 minutes (Vercel Hobby plan limit)
+export const maxDuration = 300;
 
-async function fetchPageContent(url: string): Promise<{ html: string; text: string } | null> {
-  try {
-    // Try with https first, then http if needed
-    let response;
-    let finalUrl = url;
-    
-    try {
-      response = await axios.get(url, {
-        timeout: 20000, // Increased timeout
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-          'Accept-Language': 'en-US,en;q=0.5',
-          'Accept-Encoding': 'gzip, deflate, br',
-          'Connection': 'keep-alive',
-        },
-        maxRedirects: 10,
-        validateStatus: (status) => status < 500, // Accept redirects and client errors
-      });
-    } catch (httpsError) {
-      // Try http if https fails
-      if (url.startsWith('https://')) {
-        try {
-          finalUrl = url.replace('https://', 'http://');
-          response = await axios.get(finalUrl, {
-            timeout: 20000,
-            headers: {
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-              'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            },
-            maxRedirects: 10,
-            validateStatus: (status) => status < 500,
-          });
-        } catch (httpError) {
-          console.error(`[Fetch] Both HTTPS and HTTP failed for ${url}:`, httpError);
-          return null;
-        }
-      } else {
-        console.error(`[Fetch] Error fetching ${url}:`, httpsError);
-        return null;
+const COLLEGUE_SYSTEM_WORDS = /\b(student|system|ERP|SIS|Banner|registration|HR|finance|payroll|portal|information)\b/i;
+
+/** Step 1: Detect legacy references. Returns snippets that reference CougarWeb or Colleague in a system sense. */
+function findLegacySnippets(html: string, text: string): Array<{ snippet: string; offset: number }> {
+  const results: Array<{ snippet: string; offset: number }> = [];
+  const normalized = text;
+
+  // Hard matches (case-insensitive): cougarweb, cougar web
+  const cougarRegex = /\b(cougar\s*web|cougarweb)\b/gi;
+  let m;
+  while ((m = cougarRegex.exec(normalized)) !== null) {
+    const start = Math.max(0, m.index - 80);
+    const end = Math.min(normalized.length, m.index + 120);
+    const snippet = normalized.slice(start, end).replace(/\s+/g, ' ').trim();
+    if (snippet.length > 20 && !results.some((r) => r.snippet === snippet)) {
+      results.push({ snippet, offset: m.index });
+    }
+  }
+
+  // Colleague when near system-related words (ignore plain "consult your colleague")
+  const colleagueRegex = /\bcolleague\b/gi;
+  while ((m = colleagueRegex.exec(normalized)) !== null) {
+    const windowStart = Math.max(0, m.index - 100);
+    const windowEnd = Math.min(normalized.length, m.index + 100);
+    const window = normalized.slice(windowStart, windowEnd);
+    if (COLLEGUE_SYSTEM_WORDS.test(window)) {
+      const snippet = window.replace(/\s+/g, ' ').trim();
+      if (snippet.length > 20 && !results.some((r) => r.snippet === snippet)) {
+        results.push({ snippet, offset: m.index });
       }
     }
+  }
 
-    // Check if we got valid content
-    if (!response || !response.data) {
-      console.error(`[Fetch] No data received for ${url}`);
-      return null;
-    }
+  return results;
+}
 
+async function fetchPageContent(url: string): Promise<{ html: string; text: string; title: string } | null> {
+  try {
+    const response = await axios.get(url, {
+      timeout: 20000,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (compatible; Workday Website Scanner)',
+        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      },
+      maxRedirects: 10,
+      validateStatus: (status) => status < 500,
+    });
+
+    if (!response?.data) return null;
     const html = typeof response.data === 'string' ? response.data : JSON.stringify(response.data);
-    
-    // Extract text content from HTML (simple approach)
-    const textContent = html
+
+    const text = html
       .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
       .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
       .replace(/<[^>]+>/g, ' ')
       .replace(/\s+/g, ' ')
       .trim()
-      .substring(0, 20000); // Increased limit for deeper analysis
+      .substring(0, 30000);
 
-    if (textContent.length < 50) {
-      console.warn(`[Fetch] Very little text content extracted from ${url} (${textContent.length} chars)`);
-    }
+    const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i);
+    const title = titleMatch ? titleMatch[1].trim() : '';
 
-    return { html, text: textContent };
-  } catch (error) {
-    console.error(`[Fetch] Error fetching ${url}:`, error instanceof Error ? error.message : error);
+    return { html, text, title };
+  } catch {
     return null;
   }
-}
-
-// Function to detect outdated Blackboard Learn terminology
-function detectOutdatedTerminology(text: string): Array<{ 
-  term: string; 
-  context: string; 
-  severity: 'low' | 'medium' | 'high';
-  location?: string;
-}> {
-  const issues: Array<{ term: string; context: string; severity: 'low' | 'medium' | 'high'; location?: string }> = [];
-  
-  // Common outdated Blackboard Learn terms
-  const outdatedTerms = [
-    { pattern: /\bBlackboard Learn\b/gi, severity: 'high' as const },
-    { pattern: /\bBb Learn\b/gi, severity: 'high' as const },
-    { pattern: /\bLearn\s+\(Blackboard\)\b/gi, severity: 'high' as const },
-    { pattern: /\bBlackboard\s+Learn\s+9\.\d+\b/gi, severity: 'high' as const },
-    { pattern: /\bclassic\s+Blackboard\b/gi, severity: 'medium' as const },
-    { pattern: /\bBlackboard\s+Classic\b/gi, severity: 'medium' as const },
-    { pattern: /\bold\s+Blackboard\b/gi, severity: 'medium' as const },
-  ];
-
-  const sentences = text.match(/[^.!?]+[.!?]+/g) || [text];
-  
-  sentences.forEach((sentence, index) => {
-    outdatedTerms.forEach(({ pattern, severity }) => {
-      if (pattern.test(sentence)) {
-        const matches = sentence.match(pattern);
-        if (matches) {
-          matches.forEach(match => {
-            issues.push({
-              term: match,
-              context: sentence.trim().substring(0, 200),
-              severity,
-              location: `Sentence ${index + 1}`,
-            });
-          });
-        }
-      }
-    });
-  });
-
-  return issues;
 }
 
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    const { urls } = body;
+    const { urls, keywords = [], workStreamAreas = [] } = body;
 
     if (!urls || !Array.isArray(urls) || urls.length === 0) {
       return NextResponse.json(
-        { success: false, error: 'URLs array is required' },
+        { success: false, error: 'urls array is required' },
         { status: 400 }
       );
     }
 
     if (urls.length > 100) {
       return NextResponse.json(
-        { success: false, error: 'Maximum 100 URLs allowed' },
+        { success: false, error: 'Maximum 100 URLs per request' },
         { status: 400 }
       );
     }
 
-    const results = [];
+    const results: Array<{
+      url: string;
+      pageTitle: string;
+      hasLegacyReferences: boolean;
+      findings: Array<{
+        html_context: string;
+        primary_audience: string;
+        task_category: string;
+        reference_type: string;
+        workday_feature: string;
+        proposed_replacement: string;
+        suggested_keywords: string[];
+        confidence: 'high' | 'medium' | 'low';
+        notes?: string;
+      }>;
+    }> = [];
 
     for (const url of urls) {
-      try {
-        console.log(`[Analyze] Processing URL: ${url}`);
-        const pageContent = await fetchPageContent(url);
+      const pageContent = await fetchPageContent(url);
+      if (!pageContent) {
+        results.push({
+          url,
+          pageTitle: '',
+          hasLegacyReferences: false,
+          findings: [],
+        });
+        continue;
+      }
 
-        if (!pageContent) {
-          console.error(`[Analyze] Failed to fetch page content for ${url}`);
-          results.push({
-            url,
-            success: false,
-            error: 'Failed to fetch page content',
-            risks: [],
-            summary: 'Unable to analyze - page could not be fetched',
-            riskLevel: 'high',
-            issues: [],
-          });
-          continue;
-        }
+      const snippets = findLegacySnippets(pageContent.html, pageContent.text);
+      if (snippets.length === 0) {
+        results.push({
+          url,
+          pageTitle: pageContent.title,
+          hasLegacyReferences: false,
+          findings: [],
+        });
+        continue;
+      }
 
-        console.log(`[Analyze] Successfully fetched content for ${url}, text length: ${pageContent.text.length}`);
+      const findings: Array<{
+        html_context: string;
+        primary_audience: string;
+        task_category: string;
+        reference_type: string;
+        workday_feature: string;
+        proposed_replacement: string;
+        suggested_keywords: string[];
+        confidence: 'high' | 'medium' | 'low';
+        notes?: string;
+      }> = [];
 
-        // Detect outdated Blackboard Learn terminology
-        const outdatedIssues = detectOutdatedTerminology(pageContent.text);
-        
-        // Get relevant Blackboard Ultra context from vector database
-        let ultraContext = '';
-        try {
-          console.log(`[Analyze] Querying vector database for ${url}`);
-          const queryEmbedding = await getEmbedding(pageContent.text.substring(0, 5000));
-          const matches = await queryPinecone(queryEmbedding, 10);
-          
-          ultraContext = matches
-            .map((match) => {
-              const metadata = match.metadata || {};
-              return `[${metadata.title || 'Document'}]: ${metadata.text || ''}`;
-            })
-            .join('\n\n');
-          
-          console.log(`[Analyze] Found ${matches.length} relevant chunks from vector database`);
-        } catch (error) {
-          console.error(`[Analyze] Error querying vector database for ${url}:`, error);
-          // Continue without context - analysis will still work
-        }
+      const workStreamHint =
+        workStreamAreas?.length > 0
+          ? `The college provided these work stream areas to consider: ${workStreamAreas.join(', ')}.`
+          : '';
+      const keywordHint =
+        keywords?.length > 0 ? `Additional keywords to consider: ${keywords.join(', ')}.` : '';
 
-        // Detect if this is an instructor-facing page
-        const isInstructorPage = /instructor|faculty|teacher|professor|staff|teaching|course\s+setup|how\s+to|tutorial|guide/i.test(pageContent.text);
-        const hasLearnFeatures = /grade\s+center|content\s+area|course\s+menu|discussion\s+board|assignment|dropbox|test|quiz|survey/i.test(pageContent.text);
+      for (const { snippet } of snippets) {
+        const prompt = `You are analyzing college web content for a Workday migration. The college is moving from CougarWeb and Colleague to Workday.
 
-        // Use AI to analyze content for outdated Blackboard Learn messaging
-        const analysisPrompt = `You are an expert in Blackboard Ultra migration and content strategy. Analyze the following webpage content to provide comprehensive messaging recommendations.
+${workStreamHint}
+${keywordHint}
 
-IMPORTANT CONTEXT:
-- Blackboard Learn is the CURRENT system the college uses
-- Blackboard Ultra is the NEW system being adopted
-- Pages should acknowledge Learn as current while promoting Ultra adoption
-- For instructor-facing pages, include links to dev shell access and workshops
+RULES:
+1. Use ONLY the page content provided. Do not invent URLs or internal feature names.
+2. Map legacy terms (CougarWeb, Colleague, "student portal," etc.) to Workday or Workday features only when clearly inferable.
+3. If context is unclear, use generic "Workday" and set confidence to "low".
 
-Webpage Content (first 18000 characters):
-${pageContent.text.substring(0, 18000)}
+STEP 1 – Detect: The following snippet has already been flagged as containing a CougarWeb or Colleague reference. Confirm it is a SYSTEM reference (not plain English "colleague").
 
-${outdatedIssues.length > 0 ? `\nDetected Outdated Terms:\n${outdatedIssues.map(i => `- "${i.term}" found in: ${i.context.substring(0, 150)}...`).join('\n')}` : ''}
+STEP 2 – Classify:
+- primary_audience: one of "students" | "employees/faculty/staff" | "mixed/other" (use lexical cues: student, enrollment, financial aid, employee, payroll, HR, etc.)
+- task_category: one of "registration_and_academic_planning" | "grades_transcripts_and_records" | "student_finance_and_aid" | "general_student_portal_access" | "hr_time_payroll" | "employee_self_service_other" | "administrative_reporting_and_advising" | "generic_system_reference"
+- reference_type: one of "action_portal" | "informational_reference" | "historical_reference"
 
-${ultraContext ? `\nRelevant Blackboard Ultra Context from Knowledge Base:\n${ultraContext.substring(0, 4000)}` : '\nNote: No relevant context found in knowledge base.'}
+STEP 3 – Map to Workday using the mapping table (e.g. registration + students → "Workday Student – academic planning and registration"). Emit workday_feature and set confidence: "high" | "medium" | "low".
 
-Page Context:
-- Instructor-facing: ${isInstructorPage ? 'YES - Include dev shell and workshop links' : 'NO'}
-- Mentions Learn features: ${hasLearnFeatures ? 'YES - Needs Ultra feature comparison' : 'NO'}
+STEP 4 – Rewrite: Provide proposed_replacement (full suggested replacement text for the snippet, before/after style). Preserve intent and tone. No fabricated URLs.
 
-Your comprehensive analysis should:
+STEP 5 – Suggest 3–6 Workday keywords for SEO (include "Workday", task and audience).
 
-1. CURRENT RELEVANCE ASSESSMENT:
-   - Is this page still relevant for current Blackboard Learn users?
-   - What content is still accurate for Learn?
-   - What content needs updating for Learn?
+STEP 6 – If unsure, use generic "Workday is the college's new system for managing your information and services" and confidence "low" with brief notes.
 
-2. FUTURE RELEVANCE ASSESSMENT:
-   - Is this page relevant for Blackboard Ultra adoption?
-   - What content should be updated to promote Ultra?
-   - What content should be removed or archived?
+Snippet to analyze:
+"""
+${snippet}
+"""
 
-3. MESSAGING STRATEGY:
-   - How to acknowledge Learn as current while promoting Ultra
-   - Specific wording changes needed
-   - Tone and positioning recommendations
-
-4. INSTRUCTOR-SPECIFIC RECOMMENDATIONS (if instructor-facing):
-   - Add link to dev shell: www.cs-cc.edu/ultra
-   - Mention workshops and training
-   - Highlight Ultra features that improve student learning
-   - Provide transition guidance
-
-5. SPECIFIC CHANGES:
-   - Exact text to replace
-   - New text to add
-   - Sections to remove or update
-   - Links to add
-
-Provide a JSON response with this structure:
+Respond with ONLY a single JSON object (no markdown, no other text):
 {
-  "risks": ["specific issue 1 with context", "specific issue 2 with context", ...],
-  "summary": "Comprehensive summary of current relevance, future relevance, and required changes",
-  "riskLevel": "low" | "medium" | "high",
-  "currentRelevance": {
-    "isRelevant": true | false,
-    "reason": "Why this page is or isn't relevant for current Learn users",
-    "accurateContent": ["list of content that's still accurate"],
-    "needsUpdating": ["list of content that needs updating for Learn"]
-  },
-  "futureRelevance": {
-    "isRelevant": true | false,
-    "reason": "Why this page is or isn't relevant for Ultra adoption",
-    "shouldUpdate": true | false,
-    "shouldArchive": true | false,
-    "reasoning": "Explanation of update vs archive decision"
-  },
-  "messagingStrategy": {
-    "currentState": "How to acknowledge Learn as current system",
-    "transitionMessage": "How to promote Ultra adoption",
-    "tone": "Recommended tone and positioning",
-    "keyMessages": ["key message 1", "key message 2", ...]
-  },
-  "issues": [
-    {
-      "type": "Outdated Terminology" | "Feature Reference" | "Workflow Reference" | "Instructional Content" | "Missing Ultra Link" | "Messaging Update",
-      "description": "Detailed description of what needs changing and why",
-      "currentText": "The exact current text found",
-      "suggestedReplacement": "Specific suggested replacement text",
-      "reasoning": "Why this change is needed",
-      "location": "Where in the content (section, paragraph, etc.)",
-      "severity": "low" | "medium" | "high",
-      "priority": "immediate" | "high" | "medium" | "low"
-    }
-  ],
-  "instructorRecommendations": ${isInstructorPage ? `{
-    "addDevShellLink": true,
-    "devShellLinkText": "Suggested text for dev shell link",
-    "workshopMention": "Suggested text mentioning workshops",
-    "ultraFeaturesToHighlight": ["feature 1", "feature 2", ...],
-    "transitionGuidance": "Suggested guidance for instructors transitioning to Ultra"
-  }` : 'null'},
-  "outdatedTermsFound": ["list of outdated terms found"],
-  "updatePriority": "high" | "medium" | "low",
-  "specificChanges": [
-    {
-      "action": "replace" | "add" | "remove" | "update",
-      "currentText": "Exact text to change",
-      "newText": "New text",
-      "location": "Where to make change",
-      "reason": "Why this change is needed"
-    }
-  ]
-}
+  "primary_audience": "students" | "employees/faculty/staff" | "mixed/other",
+  "task_category": "one of the task_category values above",
+  "reference_type": "action_portal" | "informational_reference" | "historical_reference",
+  "workday_feature": "short label e.g. Workday Student – academic planning and registration",
+  "proposed_replacement": "full replacement text for the snippet",
+  "suggested_keywords": ["Workday", "keyword2", ...],
+  "confidence": "high" | "medium" | "low",
+  "notes": "optional brief note if low confidence"
+}`;
 
-Only return valid JSON, no other text.`;
-
-        // Get AI analysis
-        let analysis;
         try {
-          console.log(`[Analyze] Starting AI analysis for ${url}`);
-          const analysisResponse = await chatCompletion(
-            [
-              {
-                role: 'user',
-                content: analysisPrompt,
-              },
-            ],
-            ultraContext ? ultraContext : undefined,
-            { temperature: 0.3 }
+          const response = await chatCompletion(
+            [{ role: 'user', content: prompt }],
+            undefined,
+            { temperature: 0.2 }
           );
 
-          console.log(`[Analyze] AI response received, length: ${analysisResponse.length}`);
-
-          // Parse AI response
-          try {
-            const jsonMatch = analysisResponse.match(/\{[\s\S]*\}/);
-            if (jsonMatch) {
-              analysis = JSON.parse(jsonMatch[0]);
-              console.log(`[Analyze] Successfully parsed JSON response`);
-            } else {
-              console.error(`[Analyze] No JSON found in response. Response preview: ${analysisResponse.substring(0, 200)}`);
-              throw new Error('No JSON found in response');
-            }
-          } catch (parseError) {
-            console.error(`[Analyze] Error parsing analysis response:`, parseError);
-            console.error(`[Analyze] Response was: ${analysisResponse.substring(0, 500)}`);
-            throw parseError;
+          const jsonMatch = response.match(/\{[\s\S]*\}/);
+          if (jsonMatch) {
+            const parsed = JSON.parse(jsonMatch[0]);
+            findings.push({
+              html_context: snippet,
+              primary_audience: parsed.primary_audience || 'mixed/other',
+              task_category: parsed.task_category || 'generic_system_reference',
+              reference_type: parsed.reference_type || 'informational_reference',
+              workday_feature: parsed.workday_feature || 'Workday – unified cloud-based system',
+              proposed_replacement: parsed.proposed_replacement || snippet,
+              suggested_keywords: Array.isArray(parsed.suggested_keywords) ? parsed.suggested_keywords : ['Workday'],
+              confidence: ['high', 'medium', 'low'].includes(parsed.confidence) ? parsed.confidence : 'low',
+              notes: parsed.notes,
+            });
+          } else {
+            findings.push({
+              html_context: snippet,
+              primary_audience: 'mixed/other',
+              task_category: 'generic_system_reference',
+              reference_type: 'informational_reference',
+              workday_feature: 'Workday – unified cloud-based system',
+              proposed_replacement: snippet.replace(/\b(cougar\s*web|cougarweb|colleague)\b/gi, 'Workday'),
+              suggested_keywords: ['Workday'],
+              confidence: 'low',
+              notes: 'AI response could not be parsed',
+            });
           }
-        } catch (aiError) {
-          console.error(`[Analyze] Error during AI analysis for ${url}:`, aiError);
-          // Fallback to pattern-based analysis
-          analysis = {
-            risks: outdatedIssues.length > 0 
-              ? [`Found ${outdatedIssues.length} instance(s) of outdated Blackboard Learn terminology`]
-              : ['No obvious outdated terminology detected'],
-            summary: outdatedIssues.length > 0 
-              ? `Found ${outdatedIssues.length} instance(s) of outdated Blackboard Learn terminology that should be updated to Blackboard Ultra.`
-              : 'No obvious outdated messaging detected.',
-            riskLevel: outdatedIssues.length > 0 ? 'high' : 'low',
-            issues: outdatedIssues.map(i => ({
-              type: 'Outdated Terminology',
-              description: `Found outdated term: ${i.term}`,
-              outdatedText: i.term,
-              suggestedReplacement: 'Blackboard Ultra',
-              location: i.location,
-              severity: i.severity,
-            })),
-            outdatedTermsFound: outdatedIssues.map(i => i.term),
-            updatePriority: outdatedIssues.length > 0 ? 'high' : 'low',
-          };
+        } catch (err) {
+          findings.push({
+            html_context: snippet,
+            primary_audience: 'mixed/other',
+            task_category: 'generic_system_reference',
+            reference_type: 'informational_reference',
+            workday_feature: 'Workday – unified cloud-based system',
+            proposed_replacement: snippet.replace(/\b(cougar\s*web|cougarweb|colleague)\b/gi, 'Workday'),
+            suggested_keywords: ['Workday'],
+            confidence: 'low',
+            notes: err instanceof Error ? err.message : 'Analysis failed',
+          });
         }
-
-        // Combine detected issues with AI analysis
-        const allIssues = [
-          ...(analysis.issues || []),
-          ...outdatedIssues.map(i => ({
-            type: 'Outdated Terminology',
-            description: `Found outdated term: ${i.term}. This should be updated to acknowledge Learn as current while promoting Ultra adoption.`,
-            currentText: i.term,
-            outdatedText: i.term,
-            suggestedReplacement: 'Blackboard Ultra (or appropriate messaging acknowledging Learn as current)',
-            reasoning: 'Terminology needs to reflect that Learn is current but Ultra is the future direction',
-            location: i.location,
-            severity: i.severity,
-            priority: i.severity === 'high' ? 'high' : 'medium',
-          })),
-        ];
-
-        // Remove duplicates
-        const uniqueIssues = allIssues.filter((issue, index, self) =>
-          index === self.findIndex((i) => 
-            (i.currentText || i.outdatedText) === (issue.currentText || issue.outdatedText) && 
-            i.location === issue.location
-          )
-        );
-
-        const allRisks = [
-          ...(analysis.risks || []),
-          ...uniqueIssues.map(i => i.description || `${i.type}: ${i.description}`),
-        ];
-
-        // Determine overall risk level - prioritize high-severity issues
-        const highSeverityIssues = uniqueIssues.filter(i => i.severity === 'high').length;
-        const mediumSeverityIssues = uniqueIssues.filter(i => i.severity === 'medium').length;
-        const highPriorityIssues = uniqueIssues.filter(i => i.priority === 'immediate' || i.priority === 'high').length;
-        
-        let overallRiskLevel = analysis.riskLevel || (outdatedIssues.length > 0 ? 'high' : 'low');
-        if (highSeverityIssues > 0 || highPriorityIssues > 0 || allRisks.length > 5) {
-          overallRiskLevel = 'high';
-        } else if (mediumSeverityIssues > 0 || allRisks.length > 2) {
-          overallRiskLevel = 'medium';
-        }
-
-        // Build comprehensive summary
-        let comprehensiveSummary = analysis.summary || '';
-        if (analysis.currentRelevance) {
-          comprehensiveSummary += `\n\nCURRENT RELEVANCE: ${analysis.currentRelevance.isRelevant ? 'Relevant' : 'Not relevant'} - ${analysis.currentRelevance.reason}`;
-        }
-        if (analysis.futureRelevance) {
-          comprehensiveSummary += `\n\nFUTURE RELEVANCE: ${analysis.futureRelevance.isRelevant ? 'Relevant' : 'Not relevant'} - ${analysis.futureRelevance.reasoning || analysis.futureRelevance.reason}`;
-        }
-        if (analysis.messagingStrategy) {
-          comprehensiveSummary += `\n\nMESSAGING STRATEGY: ${analysis.messagingStrategy.transitionMessage || 'See detailed recommendations'}`;
-        }
-
-        results.push({
-          url,
-          success: true,
-          risks: allRisks,
-          summary: comprehensiveSummary || (outdatedIssues.length > 0 
-            ? `Found ${outdatedIssues.length} instances of Blackboard Learn references. Needs messaging update to acknowledge Learn as current while promoting Ultra adoption.`
-            : 'No obvious outdated messaging detected.'),
-          riskLevel: overallRiskLevel,
-          issues: uniqueIssues,
-          outdatedTermsFound: analysis.outdatedTermsFound || outdatedIssues.map(i => i.term),
-          updatePriority: analysis.updatePriority || overallRiskLevel,
-          currentRelevance: analysis.currentRelevance,
-          futureRelevance: analysis.futureRelevance,
-          messagingStrategy: analysis.messagingStrategy,
-          instructorRecommendations: analysis.instructorRecommendations,
-          specificChanges: analysis.specificChanges || [],
-        });
-      } catch (error) {
-        console.error(`[Analyze] Error analyzing ${url}:`, error);
-        console.error(`[Analyze] Error stack:`, error instanceof Error ? error.stack : 'No stack trace');
-        results.push({
-          url,
-          success: false,
-          error: error instanceof Error ? error.message : 'Unknown error',
-          risks: [`Analysis failed: ${error instanceof Error ? error.message : 'Unknown error'}`],
-          summary: `Analysis failed: ${error instanceof Error ? error.message : 'Unknown error'}`,
-          riskLevel: 'high',
-          issues: [],
-        });
       }
+
+      results.push({
+        url,
+        pageTitle: pageContent.title,
+        hasLegacyReferences: true,
+        findings,
+      });
     }
 
-    return NextResponse.json({
-      success: true,
-      results,
-    });
+    return NextResponse.json({ success: true, results });
   } catch (error) {
-    console.error('[Analyze] Website analysis error:', error);
-    console.error('[Analyze] Error stack:', error instanceof Error ? error.stack : 'No stack trace');
+    console.error('[Analyze]', error);
     return NextResponse.json(
       {
         success: false,
         error: error instanceof Error ? error.message : 'Failed to analyze websites',
-        details: error instanceof Error ? error.stack : undefined,
       },
       { status: 500 }
     );

@@ -118,7 +118,7 @@ async function crawlWebsite(
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    const { url, maxUrls = 100, maxDepth = 3 } = body;
+    const { url, maxUrls = 200, maxDepth = 5, keywords, workStreamAreas } = body;
 
     if (!url) {
       return NextResponse.json(
@@ -139,16 +139,16 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    if (maxUrls > 100) {
+    if (maxUrls > 300) {
       return NextResponse.json(
-        { success: false, error: 'Maximum 100 URLs allowed' },
+        { success: false, error: 'Maximum 300 URLs allowed' },
         { status: 400 }
       );
     }
 
-    if (maxDepth > 3) {
+    if (maxDepth > 5) {
       return NextResponse.json(
-        { success: false, error: 'Maximum depth is 3 layers' },
+        { success: false, error: 'Maximum depth is 5 layers' },
         { status: 400 }
       );
     }
@@ -159,6 +159,8 @@ export async function POST(request: NextRequest) {
       success: true,
       urls,
       count: urls.length,
+      keywords: keywords || [],
+      workStreamAreas: workStreamAreas || [],
     });
   } catch (error) {
     console.error('Website scan error:', error);

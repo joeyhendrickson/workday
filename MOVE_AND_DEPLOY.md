@@ -6,20 +6,17 @@ Run these commands in your terminal:
 
 ```bash
 # Navigate to Projects directory
-cd "/Users/josephhendrickson/Code Local Storage/Projects"
+cd "/Users/josephhendrickson/Code Local Storage/Projects/WorkDay"
 
-# Create UltraAdvisor directory if it doesn't exist
-mkdir -p UltraAdvisor
-
-# Move the ultrawebaudit folder
-mv "Ultra Web Audit/ultrawebaudit" UltraAdvisor/
+# Ensure the folder is named "workday advisor"
+mv ultrawebaudit "workday advisor"
 ```
 
 ## Step 2: Verify the Move
 
 ```bash
 # Navigate to the new location
-cd UltraAdvisor/ultrawebaudit
+cd "/Users/josephhendrickson/Code Local Storage/Projects/WorkDay/workday advisor"
 
 # Verify package.json exists
 ls -la package.json
@@ -35,7 +32,7 @@ git remote -v
 
 ```bash
 # Make sure you're in the project directory
-cd "/Users/josephhendrickson/Code Local Storage/Projects/UltraAdvisor/ultrawebaudit"
+cd "/Users/josephhendrickson/Code Local Storage/Projects/WorkDay/workday advisor"
 
 # Add any changes (moving doesn't change git, but good to check)
 git add .
@@ -50,7 +47,7 @@ git push origin main
 ## Step 4: Redeploy in Vercel
 
 1. Go to [Vercel Dashboard](https://vercel.com/dashboard)
-2. Select your project: `ultrawebaudit`
+2. Select your project: `workday-advisor`
 3. Go to **Deployments** tab
 4. Click **"..."** on your latest deployment
 5. Click **"Redeploy"**

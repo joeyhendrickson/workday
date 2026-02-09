@@ -27,7 +27,7 @@ export async function queryPinecone(
   namespace?: string
 ) {
   const client = await getPineconeClient();
-  const indexName = process.env.PINECONE_INDEX_NAME || 'ultra-index';
+  const indexName = process.env.PINECONE_INDEX_NAME || 'workday-index';
   const index = client.index(indexName);
 
   if (namespace) {
@@ -52,7 +52,7 @@ export async function queryPineconeByFileId(
   namespace?: string
 ) {
   const client = await getPineconeClient();
-  const indexName = process.env.PINECONE_INDEX_NAME || 'ultra-index';
+  const indexName = process.env.PINECONE_INDEX_NAME || 'workday-index';
   const index = client.index(indexName);
 
   // Use a dummy vector for the query (we're filtering by metadata)
@@ -136,7 +136,7 @@ export async function upsertToPinecone(
   namespace?: string
 ) {
   const client = await getPineconeClient();
-  const indexName = process.env.PINECONE_INDEX_NAME || 'ultra-index';
+  const indexName = process.env.PINECONE_INDEX_NAME || 'workday-index';
   const index = client.index(indexName);
 
   console.log(`Upserting ${vectors.length} vector(s) to Pinecone index: ${indexName}`);

@@ -5,8 +5,8 @@ import './globals.css';
 const inter = Inter({ subsets: ['latin'] });
 
 export const metadata: Metadata = {
-  title: 'Ultra Advisor',
-  description: 'Ultra How To Advisor and Web Content Analysis Tool, Powered by AI',
+  title: 'WorkDay Website Scanner',
+  description: 'Find CougarWeb and Colleague references across college sites and get Workday-based messaging updates and recommended copy.',
 };
 
 export default function RootLayout({
