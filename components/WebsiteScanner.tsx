@@ -299,36 +299,129 @@ export default function WebsiteScanner() {
     (s) => s.analysis?.hasLegacyReferences && (s.analysis.findings?.length ?? 0) > 0
   );
 
-  const exportReport = () => {
-    const report = {
-      generatedAt: new Date().toISOString(),
-      startUrl: baseUrl,
-      keywords: keywords.split(/[,;]/).map((k) => k.trim()).filter(Boolean),
-      workStreamAreas: workStreamAreas.split(/[,;]/).map((w) => w.trim()).filter(Boolean),
-      totalUrlsScanned: scannedURLs.length,
-      urlsWithLegacyReferences: urlsWithFindings.length,
-      urlList: scannedURLs.map((s) => ({ url: s.url, depth: s.depth })),
-      recommendedUpdates: urlsWithFindings.map((s) => ({
-        url: s.url,
-        pageTitle: s.analysis?.pageTitle,
-        findings: s.analysis?.findings?.map((f) => ({
-          current: f.html_context,
-          proposed: f.proposed_replacement,
-          audience: f.primary_audience,
-          taskCategory: f.task_category,
-          workdayFeature: f.workday_feature,
-          suggestedKeywords: f.suggested_keywords,
-          confidence: f.confidence,
-          notes: f.notes,
-        })),
+  const reportData = () => ({
+    generatedAt: new Date().toISOString(),
+    startUrl: baseUrl,
+    keywords: keywords.split(/[,;]/).map((k) => k.trim()).filter(Boolean),
+    workStreamAreas: workStreamAreas.split(/[,;]/).map((w) => w.trim()).filter(Boolean),
+    totalUrlsScanned: scannedURLs.length,
+    urlsWithLegacyReferences: urlsWithFindings.length,
+    urlList: scannedURLs.map((s) => ({ url: s.url, depth: s.depth })),
+    recommendedUpdates: urlsWithFindings.map((s) => ({
+      url: s.url,
+      pageTitle: s.analysis?.pageTitle,
+      findings: s.analysis?.findings?.map((f) => ({
+        current: f.html_context,
+        proposed: f.proposed_replacement,
+        audience: f.primary_audience,
+        taskCategory: f.task_category,
+        workdayFeature: f.workday_feature,
+        suggestedKeywords: f.suggested_keywords,
+        confidence: f.confidence,
+        notes: f.notes,
       })),
-    };
+    })),
+  });
+
+  const exportReport = () => {
+    const report = reportData();
     const blob = new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
     a.download = `workday-scanner-report-${new Date().toISOString().slice(0, 10)}.json`;
     a.click();
     URL.revokeObjectURL(a.href);
+  };
+
+  const exportReportAsWord = async () => {
+    const report = reportData();
+    const date = new Date().toISOString().slice(0, 10);
+    try {
+      const { Document, Packer, Paragraph, TextRun, HeadingLevel } = await import('docx');
+      const children: Paragraph[] = [
+        new Paragraph({
+          text: 'Workday Website Scanner Report',
+          heading: HeadingLevel.TITLE,
+          spacing: { after: 200 },
+        }),
+        new Paragraph({
+          children: [
+            new TextRun({ text: 'Generated: ', bold: true }),
+            new TextRun(report.generatedAt),
+          ],
+        }),
+        new Paragraph({
+          children: [
+            new TextRun({ text: 'Start URL: ', bold: true }),
+            new TextRun(report.startUrl || '—'),
+          ],
+        }),
+        new Paragraph({
+          children: [
+            new TextRun({ text: 'Keywords: ', bold: true }),
+            new TextRun((report.keywords as string[]).length ? (report.keywords as string[]).join(', ') : '—'),
+          ],
+        }),
+        new Paragraph({
+          children: [
+            new TextRun({ text: 'Work stream areas: ', bold: true }),
+            new TextRun((report.workStreamAreas as string[]).length ? (report.workStreamAreas as string[]).join(', ') : '—'),
+          ],
+        }),
+        new Paragraph({
+          children: [
+            new TextRun({ text: 'Summary: ', bold: true }),
+            new TextRun(` ${report.totalUrlsScanned} URL(s) scanned, ${report.urlsWithLegacyReferences} with CougarWeb/Colleague references.`),
+          ],
+          spacing: { after: 200 },
+        }),
+        new Paragraph({ text: 'Full URL list', heading: HeadingLevel.HEADING_2, spacing: { before: 200, after: 120 } }),
+      ];
+      for (const item of report.urlList as Array<{ url: string; depth: number }>) {
+        children.push(new Paragraph({ text: `• ${item.url} (depth ${item.depth})`, spacing: { after: 60 } }));
+      }
+      children.push(new Paragraph({ text: 'Recommended updates', heading: HeadingLevel.HEADING_2, spacing: { before: 300, after: 120 } }));
+      for (const rec of report.recommendedUpdates as Array<{
+        url: string;
+        pageTitle?: string;
+        findings?: Array<{ current: string; proposed: string; audience: string; taskCategory: string; workdayFeature: string; suggestedKeywords: string[]; confidence: string; notes?: string }>;
+      }>) {
+        children.push(new Paragraph({ children: [new TextRun({ text: rec.url, bold: true })], spacing: { before: 200, after: 60 } }));
+        if (rec.pageTitle) {
+          children.push(new Paragraph({ text: `Page: ${rec.pageTitle}`, spacing: { after: 60 } }));
+        }
+        if (rec.findings?.length) {
+          for (let i = 0; i < rec.findings.length; i++) {
+            const f = rec.findings[i];
+            children.push(new Paragraph({ text: `Finding ${i + 1}`, heading: HeadingLevel.HEADING_3, spacing: { before: 120, after: 60 } }));
+            children.push(new Paragraph({ children: [new TextRun({ text: 'Audience: ', bold: true }), new TextRun(f.audience)] }));
+            children.push(new Paragraph({ children: [new TextRun({ text: 'Task: ', bold: true }), new TextRun(f.taskCategory)] }));
+            children.push(new Paragraph({ children: [new TextRun({ text: 'Workday feature: ', bold: true }), new TextRun(f.workdayFeature)] }));
+            children.push(new Paragraph({ children: [new TextRun({ text: 'Confidence: ', bold: true }), new TextRun(f.confidence)] }));
+            children.push(new Paragraph({ children: [new TextRun({ text: 'Current copy: ', bold: true }), new TextRun(f.current)] }));
+            children.push(new Paragraph({ children: [new TextRun({ text: 'Proposed Workday copy: ', bold: true }), new TextRun(f.proposed)] }));
+            if (f.suggestedKeywords?.length) {
+              children.push(new Paragraph({ children: [new TextRun({ text: 'Suggested keywords: ', bold: true }), new TextRun(f.suggestedKeywords.join(', '))] }));
+            }
+            if (f.notes) {
+              children.push(new Paragraph({ children: [new TextRun({ text: 'Notes: ', bold: true }), new TextRun(f.notes)] }));
+            }
+          }
+        }
+      }
+      const doc = new Document({
+        sections: [{ properties: {}, children }],
+      });
+      const blob = await Packer.toBlob(doc);
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `workday-scanner-report-${date}.docx`;
+      a.click();
+      URL.revokeObjectURL(a.href);
+    } catch (err) {
+      console.error('Word export failed:', err);
+      setError('Could not generate Word document. Try exporting as JSON instead.');
+    }
   };
 
   const getConfidenceColor = (c: string) => {
@@ -491,13 +584,22 @@ export default function WebsiteScanner() {
                 {isAnalyzing ? 'Analyzing…' : 'Analyze for Workday updates'}
               </button>
               {urlsWithFindings.length > 0 && (
-                <button
-                  type="button"
-                  onClick={exportReport}
-                  className="px-6 py-2 bg-green-600 text-white rounded-lg font-semibold hover:bg-green-700"
-                >
-                  Export report
-                </button>
+                <>
+                  <button
+                    type="button"
+                    onClick={exportReport}
+                    className="px-6 py-2 bg-green-600 text-white rounded-lg font-semibold hover:bg-green-700"
+                  >
+                    Export report (JSON)
+                  </button>
+                  <button
+                    type="button"
+                    onClick={exportReportAsWord}
+                    className="px-6 py-2 bg-blue-600 text-white rounded-lg font-semibold hover:bg-blue-700"
+                  >
+                    Export report (Word)
+                  </button>
+                </>
               )}
             </div>
           </div>
